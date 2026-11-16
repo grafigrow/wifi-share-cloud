@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
 const path = require('path');
@@ -8,13 +9,39 @@ const archiver = require('archiver');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
 
+// Optional AWS S3 / Cloudflare R2 Support
+let s3Client = null;
+const useCloudStorage = Boolean(
+  process.env.R2_ACCOUNT_ID &&
+  process.env.R2_ACCESS_KEY_ID &&
+  process.env.R2_SECRET_ACCESS_KEY &&
+  process.env.R2_BUCKET_NAME
+);
+
+if (useCloudStorage) {
+  try {
+    const { S3Client } = require('@aws-sdk/client-s3');
+    s3Client = new S3Client({
+      region: 'auto',
+      endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+      credentials: {
+        accessKeyId: process.env.R2_ACCESS_KEY_ID,
+        secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+      },
+    });
+    console.log('  [Storage] Connected to Cloudflare R2 Bucket:', process.env.R2_BUCKET_NAME);
+  } catch (err) {
+    console.error('  [Storage] Failed to initialize Cloudflare R2:', err.message);
+  }
+}
+
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 let publicTunnelUrl = null;
 
 // --- Config & Auth ---
 const CONFIG_FILE = path.join(__dirname, 'config.json');
-let config = { ownerPin: '1234' };
+let config = { ownerPin: process.env.OWNER_PIN || '1234' };
 try {
   if (fs.existsSync(CONFIG_FILE)) {
     config = JSON.parse(fs.readFileSync(CONFIG_FILE, 'utf8'));
@@ -35,7 +62,7 @@ function saveConfig() {
 
 const activeTokens = new Set();
 
-// --- Shared Files Directory ---
+// --- Local Shared Files Directory (used when not in S3 mode) ---
 const SHARED_DIR = path.join(__dirname, 'shared-files');
 if (!fs.existsSync(SHARED_DIR)) fs.mkdirSync(SHARED_DIR, { recursive: true });
 
@@ -59,7 +86,6 @@ function getLocalIP() {
       }
     }
   }
-  // Fallback: any non-internal IPv4
   for (const name in interfaces) {
     for (const iface of interfaces[name]) {
       if (iface.family === 'IPv4' && !iface.internal) return iface.address;
@@ -136,8 +162,10 @@ function countFiles(dir) {
   return count;
 }
 
-// --- Multer Upload (preserves folder structure) ---
-const storage = multer.diskStorage({
+// --- Multer Storage (Local or Memory for R2) ---
+const uploadMemory = multer({ storage: multer.memoryStorage(), limits: { fileSize: 20 * 1024 * 1024 * 1024 } });
+
+const localStorageEngine = multer.diskStorage({
   destination: function(req, file, cb) {
     const currentDir = req.body.currentDir || '';
     const baseTarget = getSafePath(currentDir);
@@ -180,7 +208,7 @@ const storage = multer.diskStorage({
     }
   }
 });
-const upload = multer({ storage, limits: { fileSize: 20 * 1024 * 1024 * 1024 } }); // 20GB limit
+const uploadLocal = multer({ storage: localStorageEngine, limits: { fileSize: 20 * 1024 * 1024 * 1024 } });
 
 // --- Middleware ---
 app.use((req, res, next) => {
@@ -193,10 +221,77 @@ app.use('/static', express.static(path.join(__dirname, 'public')));
 
 // --- API Routes ---
 
-// List files
-app.get('/api/files', function(req, res) {
+// List files (Supports Cloudflare R2 or Local)
+app.get('/api/files', async function(req, res) {
   try {
     const currentDir = req.query.dir || '';
+
+    if (useCloudStorage && s3Client) {
+      const { ListObjectsV2Command } = require('@aws-sdk/client-s3');
+      const prefix = currentDir ? (currentDir.endsWith('/') ? currentDir : currentDir + '/') : '';
+
+      const command = new ListObjectsV2Command({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Prefix: prefix,
+        Delimiter: '/'
+      });
+      const s3Res = await s3Client.send(command);
+
+      const files = [];
+
+      // Subfolders
+      if (s3Res.CommonPrefixes) {
+        for (const p of s3Res.CommonPrefixes) {
+          const folderName = p.Prefix.replace(prefix, '').replace(/\/$/, '');
+          if (folderName) {
+            files.push({
+              name: folderName,
+              path: p.Prefix.replace(/\/$/, ''),
+              isDirectory: true,
+              size: 0,
+              sizeFormatted: 'Folder',
+              modified: new Date().toISOString(),
+              icon: '📁',
+              category: 'folder',
+              ext: 'folder',
+              fileCount: 0
+            });
+          }
+        }
+      }
+
+      // Files
+      if (s3Res.Contents) {
+        for (const item of s3Res.Contents) {
+          if (item.Key === prefix || item.Key.endsWith('/')) continue;
+          const fileName = path.basename(item.Key);
+          files.push({
+            name: fileName,
+            path: item.Key,
+            isDirectory: false,
+            size: item.Size,
+            sizeFormatted: formatSize(item.Size),
+            modified: item.LastModified,
+            icon: getFileIcon(fileName, false),
+            category: getFileCategory(fileName, false),
+            ext: path.extname(fileName).toLowerCase().slice(1),
+            fileCount: null
+          });
+        }
+      }
+
+      return res.json({
+        files,
+        ip: getLocalIP(),
+        port: PORT,
+        isOwner: isOwner(req),
+        publicUrl: publicTunnelUrl || (process.env.PUBLIC_URL || null),
+        currentDir,
+        storageType: 'r2'
+      });
+    }
+
+    // Local Disk Mode
     const targetDir = getSafePath(currentDir);
     if (!targetDir || !fs.existsSync(targetDir)) return res.status(404).json({ error: 'Not found' });
 
@@ -221,7 +316,6 @@ app.get('/api/files', function(req, res) {
       };
     });
 
-    // Default Sort: folders first, then by modified date desc
     files.sort(function(a, b) {
       if (a.isDirectory && !b.isDirectory) return -1;
       if (!a.isDirectory && b.isDirectory) return 1;
@@ -234,7 +328,8 @@ app.get('/api/files', function(req, res) {
       port: PORT,
       isOwner: isOwner(req),
       publicUrl: publicTunnelUrl,
-      currentDir: currentDir
+      currentDir: currentDir,
+      storageType: 'local'
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -253,8 +348,9 @@ app.get('/api/stats', function(req, res) {
       uptime: process.uptime(),
       ip: getLocalIP(),
       port: PORT,
-      publicUrl: publicTunnelUrl,
-      isOwner: isOwner(req)
+      publicUrl: publicTunnelUrl || (process.env.PUBLIC_URL || null),
+      isOwner: isOwner(req),
+      cloudMode: useCloudStorage
     });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -289,13 +385,25 @@ app.post('/api/auth/change-pin', function(req, res) {
 });
 
 // Create New Folder
-app.post('/api/folder', function(req, res) {
+app.post('/api/folder', async function(req, res) {
   try {
     const currentDir = req.body.currentDir || '';
     const name = (req.body.name || '').trim();
     if (!name || name.includes('/') || name.includes('\\') || name.includes('..')) {
       return res.status(400).json({ error: 'Invalid folder name' });
     }
+
+    if (useCloudStorage && s3Client) {
+      const { PutObjectCommand } = require('@aws-sdk/client-s3');
+      const folderKey = (currentDir ? currentDir + '/' + name : name) + '/';
+      await s3Client.send(new PutObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: folderKey,
+        Body: ''
+      }));
+      return res.json({ success: true, name: name, path: currentDir ? currentDir + '/' + name : name });
+    }
+
     const targetDir = getSafePath(path.join(currentDir, name));
     if (!targetDir) return res.status(400).json({ error: 'Invalid path' });
     if (fs.existsSync(targetDir)) return res.status(400).json({ error: 'A folder with this name already exists' });
@@ -307,7 +415,7 @@ app.post('/api/folder', function(req, res) {
 });
 
 // Rename file or folder (Owner only)
-app.post('/api/rename', function(req, res) {
+app.post('/api/rename', async function(req, res) {
   if (!isOwner(req)) return res.status(403).json({ error: 'Only owner can rename items' });
   try {
     const oldRelPath = req.body.oldPath;
@@ -315,6 +423,22 @@ app.post('/api/rename', function(req, res) {
     if (!oldRelPath || !newName || newName.includes('/') || newName.includes('\\') || newName.includes('..')) {
       return res.status(400).json({ error: 'Invalid name provided' });
     }
+
+    if (useCloudStorage && s3Client) {
+      const { CopyObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
+      const targetKey = path.posix.join(path.posix.dirname(oldRelPath), newName);
+      await s3Client.send(new CopyObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        CopySource: `${process.env.R2_BUCKET_NAME}/${oldRelPath}`,
+        Key: targetKey
+      }));
+      await s3Client.send(new DeleteObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: oldRelPath
+      }));
+      return res.json({ success: true });
+    }
+
     const src = getSafePath(oldRelPath);
     if (!src || !fs.existsSync(src)) return res.status(404).json({ error: 'Item not found' });
     const dest = path.join(path.dirname(src), newName);
@@ -327,16 +451,57 @@ app.post('/api/rename', function(req, res) {
 });
 
 // Upload
-app.post('/api/upload', upload.array('files', 1000), function(req, res) {
+const uploadHandler = useCloudStorage ? uploadMemory.array('files', 1000) : uploadLocal.array('files', 1000);
+app.post('/api/upload', uploadHandler, async function(req, res) {
   if (!req.files || req.files.length === 0) return res.status(400).json({ error: 'No files uploaded' });
+
+  if (useCloudStorage && s3Client) {
+    try {
+      const { PutObjectCommand } = require('@aws-sdk/client-s3');
+      let paths = [];
+      try { paths = JSON.parse(req.body.paths || '[]'); } catch (e) {}
+      const currentDir = req.body.currentDir || '';
+
+      for (let i = 0; i < req.files.length; i++) {
+        const file = req.files[i];
+        const customPath = paths[i] || file.originalname;
+        const key = currentDir ? path.posix.join(currentDir, customPath) : customPath;
+
+        await s3Client.send(new PutObjectCommand({
+          Bucket: process.env.R2_BUCKET_NAME,
+          Key: key,
+          Body: file.buffer,
+          ContentType: file.mimetype
+        }));
+      }
+      return res.json({ success: true, count: req.files.length });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
+
   res.json({ success: true, count: req.files.length });
 });
 
 // Bulk Delete (owner only)
-app.delete('/api/files', function(req, res) {
+app.delete('/api/files', async function(req, res) {
   if (!isOwner(req)) return res.status(403).json({ error: 'Only owner can delete files' });
   var filesToDelete = req.body.files;
   if (!Array.isArray(filesToDelete)) return res.status(400).json({ error: 'Invalid request' });
+
+  if (useCloudStorage && s3Client) {
+    try {
+      const { DeleteObjectsCommand } = require('@aws-sdk/client-s3');
+      const objects = filesToDelete.map(k => ({ Key: k }));
+      await s3Client.send(new DeleteObjectsCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Delete: { Objects: objects }
+      }));
+      return res.json({ success: true, deleted: filesToDelete.length });
+    } catch (err) {
+      return res.status(500).json({ error: err.message });
+    }
+  }
 
   var deleted = 0;
   for (var i = 0; i < filesToDelete.length; i++) {
@@ -354,7 +519,7 @@ app.delete('/api/files', function(req, res) {
 });
 
 // Batch Download (ZIP)
-app.post('/api/download-batch', function(req, res) {
+app.post('/api/download-batch', async function(req, res) {
   try {
     var files = JSON.parse(req.body.files || '[]');
     if (!files.length) return res.status(400).send('No files selected');
@@ -362,6 +527,20 @@ app.post('/api/download-batch', function(req, res) {
     res.attachment('WiFiShare_Archive.zip');
     var archive = archiver.create('zip', { zlib: { level: 5 } });
     archive.pipe(res);
+
+    if (useCloudStorage && s3Client) {
+      const { GetObjectCommand } = require('@aws-sdk/client-s3');
+      for (const key of files) {
+        try {
+          const s3Obj = await s3Client.send(new GetObjectCommand({
+            Bucket: process.env.R2_BUCKET_NAME,
+            Key: key
+          }));
+          archive.append(s3Obj.Body, { name: path.basename(key) });
+        } catch (e) {}
+      }
+      return archive.finalize();
+    }
 
     for (var i = 0; i < files.length; i++) {
       var filePath = getSafePath(files[i]);
@@ -378,8 +557,25 @@ app.post('/api/download-batch', function(req, res) {
 });
 
 // Preview a file
-app.get('/api/preview/*', function(req, res) {
-  var filePath = getSafePath(decodeURIComponent(req.params[0]));
+app.get('/api/preview/*', async function(req, res) {
+  const relPath = decodeURIComponent(req.params[0]);
+
+  if (useCloudStorage && s3Client) {
+    try {
+      const { GetObjectCommand } = require('@aws-sdk/client-s3');
+      const s3Obj = await s3Client.send(new GetObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: relPath
+      }));
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      res.setHeader('Content-Type', s3Obj.ContentType || 'application/octet-stream');
+      return s3Obj.Body.pipe(res);
+    } catch (e) {
+      return res.status(404).send('Not found');
+    }
+  }
+
+  var filePath = getSafePath(relPath);
   if (!filePath || !fs.existsSync(filePath)) return res.status(404).send('Not found');
   if (fs.statSync(filePath).isDirectory()) return res.status(400).send('Cannot preview folder');
   
@@ -389,8 +585,24 @@ app.get('/api/preview/*', function(req, res) {
 });
 
 // Download a file or folder
-app.get('/api/download/*', function(req, res) {
-  var filePath = getSafePath(decodeURIComponent(req.params[0]));
+app.get('/api/download/*', async function(req, res) {
+  const relPath = decodeURIComponent(req.params[0]);
+
+  if (useCloudStorage && s3Client) {
+    try {
+      const { GetObjectCommand } = require('@aws-sdk/client-s3');
+      const s3Obj = await s3Client.send(new GetObjectCommand({
+        Bucket: process.env.R2_BUCKET_NAME,
+        Key: relPath
+      }));
+      res.attachment(path.basename(relPath));
+      return s3Obj.Body.pipe(res);
+    } catch (e) {
+      return res.status(404).send('Not found');
+    }
+  }
+
+  var filePath = getSafePath(relPath);
   if (!filePath || !fs.existsSync(filePath)) return res.status(404).send('Not found');
 
   if (fs.statSync(filePath).isDirectory()) {
@@ -421,9 +633,9 @@ server.listen(PORT, '0.0.0.0', function() {
   console.log('  Local:   http://localhost:' + PORT);
   console.log('  Network: http://' + ip + ':' + PORT);
 
-  // Ngrok permanent tunnel
+  // Ngrok permanent tunnel (for local Windows running)
   var ngrokPath = path.join(__dirname, 'ngrok.exe');
-  if (fs.existsSync(ngrokPath)) {
+  if (fs.existsSync(ngrokPath) && !process.env.PORT) {
     var ngrokProcess = spawn(ngrokPath, [
       'http',
       '--domain=coffee-naturist-preschool.ngrok-free.dev',
@@ -443,11 +655,10 @@ server.listen(PORT, '0.0.0.0', function() {
     ngrokProcess.on('error', function(err) {
       console.log('  Ngrok error: ' + err.message);
     });
-  } else {
-    console.log('  ngrok.exe not found, no public link.');
   }
 
   console.log('');
+  console.log('  Mode: ' + (useCloudStorage ? 'Cloudflare R2 (24/7 Global Cloud)' : 'Local Disk'));
   console.log('  Files: ' + SHARED_DIR);
   console.log('  ==========================================');
   console.log('');
